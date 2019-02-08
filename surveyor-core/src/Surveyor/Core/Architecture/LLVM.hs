@@ -13,20 +13,32 @@
 module Surveyor.Core.Architecture.LLVM ( mkLLVMResult ) where
 
 import           Control.DeepSeq ( NFData, rnf )
-import qualified Control.Once as O
+import qualified Control.Exception as X
 import           Control.Monad ( guard )
+import           Control.Monad.ST ( stToIO, RealWorld )
+import qualified Control.Once as O
 import qualified Data.Foldable as F
+import           Data.Functor.Const ( Const(..) )
+import           Data.Kind ( Type )
 import qualified Data.Map.Strict as M
 import           Data.Maybe ( catMaybes, isJust, fromMaybe, mapMaybe )
 import           Data.Parameterized.Classes
 import qualified Data.Parameterized.Nonce as NG
+import           Data.Parameterized.Some ( Some(..) )
+import qualified Data.Parameterized.TraversableFC as FC
 import qualified Data.Text as T
+import qualified Lang.Crucible.CFG.Core as C
+import qualified Lang.Crucible.FunctionHandle as CFH
+import qualified Lang.Crucible.LLVM.Extension as LE
+import qualified Lang.Crucible.LLVM.Translation as LT
 import qualified Text.LLVM as LL
 import qualified Text.LLVM.PP as LL
 import qualified Text.PrettyPrint as PP
 import           Text.Printf ( printf )
 
 import           Surveyor.Core.Architecture.Class
+import qualified Surveyor.Core.Architecture.Crucible as AC
+import           Surveyor.Core.IRRepr ( IRRepr(MacawRepr, BaseRepr, CrucibleRepr), Crucible )
 
 data LLVM
 
@@ -34,6 +46,12 @@ data LLVMResult s =
   LLVMResult { llvmNonce :: NG.Nonce s LLVM
              , llvmModule :: LL.Module
              , llvmFunctionIndex :: FunctionIndex s
+             , llvmNonceGen :: NG.NonceGenerator IO s
+             , llvmHdlAlloc :: CFH.HandleAllocator RealWorld
+             -- ^ The handle allocator used for the Crucible translation - this needs to be kept
+             -- around to symbolically simulate later
+             , llvmCrucibleTranslation :: Some LT.ModuleTranslation
+             -- ^ The (cached) Crucible translation
              }
 
 type FunctionIndex s = M.Map LL.Symbol (FunctionHandle LLVM s, LL.Define, BlockIndex)
@@ -52,14 +70,21 @@ indexFunctions = F.foldl' indexDefine M.empty . LL.modDefines
         in M.insert (LL.defName def) (fh, def, blockIndex) m
     indexBlock m b = M.insert (LL.bbLabel b) b m
 
-mkLLVMResult :: NG.Nonce s LLVM -> LL.Module -> SomeResult s LLVM
-mkLLVMResult nonce m =
-  SomeResult (AnalysisResult (LLVMAnalysisResult lr) (indexResult lr))
-  where
-    lr = LLVMResult { llvmNonce = nonce
-                    , llvmModule = m
-                    , llvmFunctionIndex = indexFunctions m
-                    }
+mkLLVMResult :: NG.NonceGenerator IO s
+             -> NG.Nonce s LLVM
+             -> CFH.HandleAllocator RealWorld
+             -> LL.Module
+             -> IO (SomeResult s LLVM)
+mkLLVMResult ng nonce hdlAlloc m = do
+  ct <- stToIO (LT.translateModule hdlAlloc m)
+  let lr = LLVMResult { llvmNonce = nonce
+                      , llvmModule = m
+                      , llvmFunctionIndex = indexFunctions m
+                      , llvmHdlAlloc = hdlAlloc
+                      , llvmCrucibleTranslation = ct
+                      , llvmNonceGen = ng
+                      }
+  return (SomeResult (AnalysisResult (LLVMAnalysisResult lr) (indexResult lr)))
 
 indexResult :: LLVMResult s -> O.Once (ResultIndex LLVM s)
 indexResult lr = O.once idx
@@ -208,8 +233,49 @@ instance Architecture LLVM s where
   summarizeResult (AnalysisResult _ idx) = riSummary (O.runOnce idx)
   functionBlocks (AnalysisResult (LLVMAnalysisResult lr) _) fh =
     llvmFunctionBlocks lr fh
-  alternativeIRs _ = []
-  asAlternativeIR _ _ _ = return Nothing
+  alternativeIRs _ = [SomeIRRepr CrucibleRepr]
+  asAlternativeIR repr (AnalysisResult (LLVMAnalysisResult llr) _) fh =
+    case repr of
+      BaseRepr -> return Nothing
+      MacawRepr -> return Nothing
+      CrucibleRepr ->
+        crucibleForLLVMBlocks (llvmNonceGen llr) fh (llvmCrucibleTranslation llr)
+
+-- NOTE: We only support x86/llvm right now (since crucible-llvm only supports that)
+--
+-- If that changes, we'll need to extend our own LLVM type (or possibly just re-use the
+-- crucible-llvm one)
+instance AC.CrucibleExtension LLVM where
+  type CrucibleExt LLVM = LE.LLVM (LE.X86 64)
+
+data LLVMException where
+  InvalidFunctionAddress :: Addr addrTy -> LLVMException
+
+deriving instance Show LLVMException
+
+instance X.Exception LLVMException
+
+crucibleForLLVMBlocks :: NG.NonceGenerator IO s
+                      -> FunctionHandle LLVM s
+                      -> Some LT.ModuleTranslation
+                      -> IO (Maybe (BlockMapping LLVM (Crucible LLVM) s))
+crucibleForLLVMBlocks ng fh (Some mt) =
+  case fhAddress fh of
+    LLVMAddress fa@(FunctionAddr sym) ->
+      case M.lookup sym (LT.cfgMap mt) of
+        Nothing -> return Nothing
+        Just (C.AnyCFG cfg) -> do
+          blks <- FC.traverseFC (toLLVMCrucibleBlock ng fa fh) (C.cfgBlockMap cfg)
+          undefined
+    LLVMAddress a -> X.throwIO (InvalidFunctionAddress a)
+
+toLLVMCrucibleBlock :: forall s arch llvmarch blocks ret ctx
+                     . NG.NonceGenerator IO s
+                    -> Addr 'FuncK
+                    -> FunctionHandle LLVM s
+                    -> C.Block (LE.LLVM llvmarch) blocks ret ctx
+                    -> IO (Const (Maybe (Block arch s, Block (Crucible LLVM) s)) ctx)
+toLLVMCrucibleBlock ng fa fh b = undefined
 
 instance Eq (Address LLVM s) where
   LLVMAddress a1 == LLVMAddress a2 = isJust (testEquality a1 a2)

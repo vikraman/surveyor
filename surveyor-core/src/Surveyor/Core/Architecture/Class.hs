@@ -295,4 +295,4 @@ instance (NFData (Address arch s)) => NFData (FunctionHandle arch s)
 -- that are needed to use them in some cases
 data SomeIRRepr arch s where
   SomeIRRepr :: (ArchConstraints ir s, IR ir s) => IRRepr arch ir -> SomeIRRepr arch s
--- Note: this is her because it depends on ArchConstraints and IR
+-- Note: this is here because it depends on ArchConstraints and IR

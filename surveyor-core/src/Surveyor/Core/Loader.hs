@@ -16,6 +16,7 @@ import qualified Control.Concurrent.MVar as C
 import qualified Control.DeepSeq as DS
 import qualified Control.Exception as X
 import           Control.Monad ( void )
+import           Control.Monad.ST ( stToIO )
 import qualified Data.ByteString as BS
 import qualified Data.ElfEdit as E
 import qualified Data.Foldable as F
@@ -110,7 +111,9 @@ asynchronouslyLoadLLVM ng customEventChan bcPath = do
           C.writeChan customEventChan (ErrorLoadingLLVM (LL.formatError err))
         Right m -> do
           nonce <- NG.freshNonce ng
-          C.writeChan customEventChan (AnalysisFinished (A.mkLLVMResult nonce m) [])
+          hdlAlloc <- stToIO CFH.newHandleAllocator
+          llvmRes <- A.mkLLVMResult ng nonce hdlAlloc m
+          C.writeChan customEventChan (AnalysisFinished llvmRes [])
     C.putMVar mv worker
     eres <- A.waitCatch worker
     case eres of
