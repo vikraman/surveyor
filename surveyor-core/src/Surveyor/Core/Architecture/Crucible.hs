@@ -24,7 +24,14 @@ module Surveyor.Core.Architecture.Crucible (
   toRegisterOperand,
   allocateRegister,
   toExtensionOperand,
-  Instruction(..)
+  Instruction(..),
+  initialCache,
+  cacheSize,
+  crucibleStmtOperands,
+  crucibleTermStmtOperands,
+  AddrK(..),
+  Addr(..),
+  Address(..)
   ) where
 
 import           Control.DeepSeq ( NFData(rnf) )
