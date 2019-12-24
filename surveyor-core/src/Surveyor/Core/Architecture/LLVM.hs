@@ -15,7 +15,6 @@ module Surveyor.Core.Architecture.LLVM ( mkLLVMResult ) where
 import           Control.DeepSeq ( NFData, rnf )
 import qualified Control.Exception as X
 import           Control.Monad ( guard )
-import           Control.Monad.ST ( stToIO, RealWorld )
 import qualified Control.Once as O
 import qualified Data.Foldable as F
 import           Data.Functor.Const ( Const(..) )
@@ -47,7 +46,7 @@ data LLVMResult s =
              , llvmModule :: LL.Module
              , llvmFunctionIndex :: FunctionIndex s
              , llvmNonceGen :: NG.NonceGenerator IO s
-             , llvmHdlAlloc :: CFH.HandleAllocator RealWorld
+             , llvmHdlAlloc :: CFH.HandleAllocator
              -- ^ The handle allocator used for the Crucible translation - this needs to be kept
              -- around to symbolically simulate later
              , llvmCrucibleTranslation :: Some LT.ModuleTranslation
@@ -72,11 +71,12 @@ indexFunctions = F.foldl' indexDefine M.empty . LL.modDefines
 
 mkLLVMResult :: NG.NonceGenerator IO s
              -> NG.Nonce s LLVM
-             -> CFH.HandleAllocator RealWorld
+             -> CFH.HandleAllocator
              -> LL.Module
              -> IO (SomeResult s LLVM)
 mkLLVMResult ng nonce hdlAlloc m = do
-  ct <- stToIO (LT.translateModule hdlAlloc m)
+  let ?laxArith = True
+  ct <- LT.translateModule hdlAlloc m
   let lr = LLVMResult { llvmNonce = nonce
                       , llvmModule = m
                       , llvmFunctionIndex = indexFunctions m
