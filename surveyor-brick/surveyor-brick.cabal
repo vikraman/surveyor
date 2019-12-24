@@ -49,7 +49,7 @@ library
                        megaparsec >= 7 && < 8,
                        IntervalMap >= 0.6 && < 0.7,
                        regex-tdfa >= 1 && < 2,
-                       brick >= 0.30 && < 1,
+                       brick >= 0.47 && < 1,
                        vty,
                        haggle,
                        surveyor-core
