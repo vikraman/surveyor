@@ -27,6 +27,8 @@ module Surveyor.Core.Architecture.Crucible (
   Instruction(..),
   initialCache,
   cacheSize,
+  Operand(..),
+  CrucibleOperand(..),
   crucibleStmtOperands,
   crucibleTermStmtOperands,
   AddrK(..),

@@ -1,6 +1,7 @@
 -- | An implementation of 'Architecture' for LLVM bitcode
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE EmptyDataDecls #-}
+{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
@@ -325,6 +326,7 @@ instance Architecture LLVM s where
 
 data CrucibleLLVMOperand arch s where
 
+
 -- NOTE: We only support x86/llvm right now (since crucible-llvm only supports that)
 --
 -- If that changes, we'll need to extend our own LLVM type (or possibly just re-use the
@@ -335,7 +337,10 @@ instance AC.CrucibleExtension LLVM where
 
   prettyExtensionStmt _ = prettyLLVMStmt
   prettyExtensionApp _ = prettyLLVMApp
-  -- FIXME
+  prettyExtensionOperand _ o = case o of {}
+  extensionExprOperands = llvmExtensionExprOperands
+  extensionStmtOperands = llvmExtensionStmtOperands
+  -- FIXME: Figure out which kinds of LLVM-specific operands can be selected
   extensionOperandSelectable _ _ = False
 
 prettyLLVMStmt :: CCE.StmtExtension (LE.LLVM (LE.X86 64)) (C.Reg ctx) tp -> T.Text
@@ -363,6 +368,51 @@ prettyLLVMApp a =
     LE.LLVM_PointerIte {} -> "llvm.pointer-ite"
     -- FIXME: Probably need to examine the x86.ExtX86 here
     LE.X86Expr {} -> "llvm.x86-expr"
+
+llvmExtensionExprOperands :: AC.NonceCache s ctx
+                          -> NG.NonceGenerator IO s
+                          -> CCE.ExprExtension (LE.LLVM (LE.X86 64)) (C.Reg ctx) tp
+                          -> IO [Operand (AC.Crucible LLVM) s]
+llvmExtensionExprOperands cache ng e =
+  case e of
+    -- FIXME: Walk the subterm
+    LE.X86Expr x86e -> return []
+    LE.LLVM_PointerExpr nr r1 r2 -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             ]
+    LE.LLVM_PointerBlock nr r -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.toRegisterOperand cache r
+             ]
+    LE.LLVM_PointerOffset nr r -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.toRegisterOperand cache r
+             ]
+    LE.LLVM_PointerIte nr r1 r2 r3 -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             , AC.toRegisterOperand cache r3
+             ]
+
+llvmExtensionStmtOperands :: AC.NonceCache s ctx
+                          -> NG.NonceGenerator IO s
+                          -> CCE.StmtExtension (LE.LLVM (LE.X86 64)) (C.Reg ctx) tp
+                          -> IO [Operand (AC.Crucible LLVM) s]
+llvmExtensionStmtOperands cache ng s =
+  case s of
+    LE.LLVM_PushFrame gv -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv) ]
+    LE.LLVM_PopFrame gv -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv) ]
 
 data LLVMException where
   InvalidFunctionAddress :: Addr addrTy -> LLVMException
