@@ -47,6 +47,8 @@ import           Control.DeepSeq ( NFData, rnf, deepseq )
 import qualified Control.Once as O
 import qualified Data.ByteString as BS
 import qualified Data.Map as M
+import           Data.Maybe ( isJust )
+import           Data.Parameterized.Classes ( testEquality )
 import qualified Data.Parameterized.Nonce as NG
 import qualified Data.Sequence as Seq
 import qualified Data.Set as S
@@ -296,3 +298,6 @@ instance (NFData (Address arch s)) => NFData (FunctionHandle arch s)
 data SomeIRRepr arch s where
   SomeIRRepr :: (ArchConstraints ir s, IR ir s) => IRRepr arch ir -> SomeIRRepr arch s
 -- Note: this is here because it depends on ArchConstraints and IR
+
+instance Eq (SomeIRRepr arch s) where
+  SomeIRRepr r1 == SomeIRRepr r2 = isJust (testEquality r1 r2)
