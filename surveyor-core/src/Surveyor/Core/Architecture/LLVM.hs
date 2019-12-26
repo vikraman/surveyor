@@ -1,7 +1,6 @@
 -- | An implementation of 'Architecture' for LLVM bitcode
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE EmptyDataDecls #-}
-{-# LANGUAGE EmptyCase #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GADTs #-}
@@ -34,7 +33,10 @@ import qualified Data.Text as T
 import qualified Lang.Crucible.CFG.Core as C
 import qualified Lang.Crucible.CFG.Extension as CCE
 import qualified Lang.Crucible.FunctionHandle as CFH
+import qualified Lang.Crucible.LLVM.Bytes as CLLB
+import qualified Lang.Crucible.LLVM.DataLayout as CLDL
 import qualified Lang.Crucible.LLVM.Extension as LE
+import qualified Lang.Crucible.LLVM.MemModel as LLM
 import qualified Lang.Crucible.LLVM.Translation as LT
 import qualified Lang.Crucible.LLVM.TypeContext as LTC
 import           System.FilePath ( (</>) )
@@ -325,7 +327,11 @@ instance Architecture LLVM s where
         crucibleForLLVMBlocks (llvmNonceGen llr) (llvmFunctionIndex llr) fh (llvmCrucibleTranslation llr)
 
 data CrucibleLLVMOperand arch s where
-
+  Alignment :: CLDL.Alignment -> CrucibleLLVMOperand arch s
+  StringLiteral :: String -> CrucibleLLVMOperand arch s
+  StorageType :: LLM.StorageType -> CrucibleLLVMOperand arch s
+  Bytes :: CLLB.Bytes -> CrucibleLLVMOperand arch s
+  GlobalSymbol :: LLM.GlobalSymbol -> CrucibleLLVMOperand arch s
 
 -- NOTE: We only support x86/llvm right now (since crucible-llvm only supports that)
 --
@@ -337,11 +343,20 @@ instance AC.CrucibleExtension LLVM where
 
   prettyExtensionStmt _ = prettyLLVMStmt
   prettyExtensionApp _ = prettyLLVMApp
-  prettyExtensionOperand _ o = case o of {}
+  prettyExtensionOperand _ = prettyLLVMExtensionOperand
   extensionExprOperands = llvmExtensionExprOperands
   extensionStmtOperands = llvmExtensionStmtOperands
   -- FIXME: Figure out which kinds of LLVM-specific operands can be selected
   extensionOperandSelectable _ _ = False
+
+prettyLLVMExtensionOperand :: CrucibleLLVMOperand arch s -> T.Text
+prettyLLVMExtensionOperand o =
+  case o of
+    Alignment a -> T.pack (show a)
+    StringLiteral s -> T.pack (show s)
+    StorageType t -> T.pack (show t)
+    Bytes b -> T.pack (show b)
+    GlobalSymbol sym -> T.pack (show sym)
 
 prettyLLVMStmt :: CCE.StmtExtension (LE.LLVM (LE.X86 64)) (C.Reg ctx) tp -> T.Text
 prettyLLVMStmt s =
@@ -413,6 +428,92 @@ llvmExtensionStmtOperands cache ng s =
     LE.LLVM_PopFrame gv -> do
       n1 <- NG.freshNonce ng
       return [ AC.CrucibleOperand n1 (AC.GlobalVar gv) ]
+    LE.LLVM_Alloca nr gv r align locStr -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      n3 <- NG.freshNonce ng
+      n4 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.CrucibleOperand n2 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r
+             , AC.toExtensionOperand n3 (Alignment align)
+             , AC.toExtensionOperand n4 (StringLiteral locStr)
+             ]
+    LE.LLVM_Load gv r trep storageType align -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      n3 <- NG.freshNonce ng
+      n4 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r
+             , AC.CrucibleOperand n2 (AC.TypeRepr trep)
+             , AC.toExtensionOperand n3 (StorageType storageType)
+             , AC.toExtensionOperand n4 (Alignment align)
+             ]
+    LE.LLVM_Store gv r1 trep storageType align r2 -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      n3 <- NG.freshNonce ng
+      n4 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r1
+             , AC.CrucibleOperand n2 (AC.TypeRepr trep)
+             , AC.toExtensionOperand n3 (StorageType storageType)
+             , AC.toExtensionOperand n4 (Alignment align)
+             , AC.toRegisterOperand cache r2
+             ]
+    LE.LLVM_MemClear gv r bytes -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r
+             , AC.toExtensionOperand n2 (Bytes bytes)
+             ]
+    LE.LLVM_LoadHandle gv r argReprs retRepr -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      n3 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r
+             , AC.CrucibleOperand n2 (AC.CtxRepr argReprs)
+             , AC.CrucibleOperand n3 (AC.TypeRepr retRepr)
+             ]
+    LE.LLVM_ResolveGlobal nr gv gsym -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      n3 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.CrucibleOperand n2 (AC.GlobalVar gv)
+             , AC.toExtensionOperand n3 (GlobalSymbol gsym)
+             ]
+    LE.LLVM_PtrEq gv r1 r2 -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             ]
+    LE.LLVM_PtrLe gv r1 r2 -> do
+      n1 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             ]
+    LE.LLVM_PtrAddOffset nr gv r1 r2 -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.CrucibleOperand n2 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             ]
+    LE.LLVM_PtrSubtract nr gv r1 r2 -> do
+      n1 <- NG.freshNonce ng
+      n2 <- NG.freshNonce ng
+      return [ AC.CrucibleOperand n1 (AC.NatRepr nr)
+             , AC.CrucibleOperand n2 (AC.GlobalVar gv)
+             , AC.toRegisterOperand cache r1
+             , AC.toRegisterOperand cache r2
+             ]
 
 data LLVMException where
   InvalidFunctionAddress :: Addr addrTy -> LLVMException
@@ -466,14 +567,18 @@ toLLVMCrucibleBlock :: forall s blocks init ret ctx (arch :: LE.LLVMArch)
                     -> C.Block (LE.LLVM arch) blocks ret ctx
                     -> IO (BlockMapping LLVM (Crucible LLVM) s)
 toLLVMCrucibleBlock ng blockIndex (FunctionAddr sym) fh cfg bm crucBlock = do
+  let hdl = CFH.handleID (C.cfgHandle cfg)
+  let hdlNum = NG.indexValue hdl
   case M.lookup (WPL.plSourceLoc (C.blockLoc crucBlock)) (biPosToBlock blockIndex) of
     Nothing -> return bm
     Just llvmBlock -> do
       c0 <- AC.initialCache ng (C.blockInputs crucBlock)
-      let baddr = AC.BlockAddr undefined (Ctx.indexVal (C.blockIDIndex (C.blockID crucBlock)))
+      -- We use the nonce ID of the CFG for the function address; it is stable
+      -- and probably as good as any other address we could give.  Maybe it
+      -- would be better to generalize the type of function addresses for
+      -- Crucible and have it be a string for LLVM/Crucible?
+      let baddr = AC.BlockAddr (AC.FunctionAddr hdlNum) (Ctx.indexVal (C.blockIDIndex (C.blockID crucBlock)))
       stmts <- buildBlock c0 baddr 0 (crucBlock ^. C.blockStmts)
-      let hdl = CFH.handleID (C.cfgHandle cfg)
-      let hdlNum = NG.indexValue hdl
       let crucAddr = FunctionHandle { fhName = fhName fh
                                     , fhAddress = AC.CrucibleAddress (AC.FunctionAddr hdlNum)
                                     }
