@@ -28,11 +28,11 @@ module Surveyor.Core.Context (
   contextBack,
   -- *  Lenses
   currentContext,
-  contextFocusedBlock,
   blockStateFor,
   blockStateList,
   blockStateBlock,
   blockStateSelection,
+  functionStateL,
   vertexMapG,
   cfgG,
   selectedBlockL
@@ -61,6 +61,11 @@ import qualified Surveyor.Core.Architecture as CA
 import qualified Surveyor.Core.IRRepr as IR
 import qualified Surveyor.Core.TranslationCache as TC
 
+-- | The current context can either be a Function or a Block (for a given IR)
+data Context arch s where
+  FunctionContext :: IR.IRRepr arch ir -> FunctionState s ir -> Context arch s
+  BlockContext :: IR.IRRepr arch ir -> BlockState arch s ir -> Context arch s
+
 -- | A context focused (at some point) by the user, and used to inform drawing
 -- of various widgets.
 --
@@ -81,18 +86,14 @@ import qualified Surveyor.Core.TranslationCache as TC
 -- function" or "pop to previous block", which are linear (but not too
 -- expensive) operations.
 data Context arch s =
-  Context { cBaseBlock :: CA.Block arch s
-          -- ^ The base focused basic block; this is duplicated from the
-          -- BaseRepr entry in the map, but this lets us look up the base block
-          -- in a total way (without worrying about the BaseRepr not being in
-          -- the map).  The duplication isn't a problem because the 'CA.Block' is
-          -- immutable.
-          --
-          -- We only need the block here, as each block also has a reference to
-          -- its containing function.
+  Context { cFocusedObject :: FocusedObject arch s
           , cBlockStates :: MapF.MapF (IR.IRRepr arch) (BlockState arch s)
           -- ^ The set of instructions selected for each IR.  This should always
           -- be updated all at once to ensure consistency.
+          , cFunctionState :: MapF.MapF (IR.IRRepr arch) (FunctionState s)
+          -- ^ State information for the currently-selected function (in each IR)
+          }
+{-
           , cSelectedBlock :: Maybe H.Vertex
           -- ^ For the function viewer, which block is selected.
           , cCFG :: H.PatriciaTree (CA.Block arch s) ()
@@ -106,24 +107,41 @@ data Context arch s =
           -- thread *and then* send a message when it is merged into the main state.
           , cVertexMap :: Map.Map (CA.Address arch s) H.Vertex
           }
+-}
   deriving (Generic)
 
-vertexMapG :: L.Getter (Context arch s) (Map.Map (CA.Address arch s) H.Vertex)
+data FunctionState s ir =
+  FunctionState { cSelectedBlock :: Maybe H.Vertex
+                -- ^ The currently-selected block for this IR, if any
+                , cCFG :: H.PatriciaTree (CA.Block ir s) ()
+                -- ^ The CFG of the current function
+                --
+                -- FIXME: Try to cache these somewhere
+                , cVertexMap :: Map.Map (CA.Address ir s) H.Vertex
+                -- ^ A mapping from block addresses to vertices
+                }
+
+functionStateL :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (FunctionState s))
+functionStateL = GL.field @"cFunctionState"
+
+vertexMapG :: L.Getter (FunctionState s ir) (Map.Map (CA.Address ir s) H.Vertex)
 vertexMapG = L.to cVertexMap
 
-cfgG :: L.Getter (Context arch s) (H.PatriciaTree (CA.Block arch s) ())
+cfgG :: L.Getter (FunctionState s ir) (H.PatriciaTree (CA.Block ir s) ())
 cfgG = L.to cCFG
 
-selectedBlockL :: L.Lens' (Context arch s) (Maybe H.Vertex)
-selectedBlockL = GL.field @"cSelectedBlock"
+selectedBlockL :: L.Lens' (FunctionState s ir) (Maybe H.Vertex)
+selectedBlockL f fs = fmap (\sb' -> fs { cSelectedBlock = sb' }) (f (cSelectedBlock fs))
 
 instance (CA.ArchConstraints arch s) => NFData (Context arch s) where
-  rnf c = cBaseBlock c `deepseq`
-          TF.toListF forceBlockState (cBlockStates c) `deepseq` ()
+  rnf c = TF.toListF forceFunctionState (cFunctionState c) `deepseq` TF.toListF forceBlockState (cBlockStates c) `deepseq` ()
 
 forceBlockState :: BlockState arch s ir -> ()
 forceBlockState bs@BlockState { withConstraints = withC } =
   withC (bsBlock bs `deepseq` bsSelection bs `deepseq` bsList bs `deepseq` ())
+
+forceFunctionState :: FunctionState s ir -> ()
+forceFunctionState fs = cSelectedBlock fs `deepseq` cCFG fs `deepseq` cVertexMap fs `deepseq` ()
 
 data BlockState arch s ir =
   BlockState { bsBlock :: CA.Block ir s
@@ -154,11 +172,10 @@ makeContext :: forall arch s
              . (CA.Architecture arch s)
             => TC.TranslationCache arch s
             -> CA.AnalysisResult arch s
-            -> CA.Block arch s
             -> IO (Context arch s)
-makeContext tcache ares b = do
+makeContext tcache ares = do
   let supportedIRs = CA.alternativeIRs (Proxy @(arch, s))
-  blockStates <- catMaybes <$> mapM (\(CA.SomeIRRepr rep) -> makeBlockState tcache ares b rep) supportedIRs
+  blockStates <- catMaybes <$> mapM (\(CA.SomeIRRepr rep) -> makeBlockState tcache ares rep) supportedIRs
   let baseState = BlockState { bsBlock = b
                              , bsSelection = NoSelection
                              , bsList = V.fromList [ (ix, addr, i)
@@ -168,25 +185,49 @@ makeContext tcache ares b = do
                              , withConstraints = \a -> a
                              , bsRepr = IR.BaseRepr
                              }
-  let (cfg, vm) = mkCFG ares (CA.blockFunction b)
-  return Context { cBaseBlock = b
-                 , cBlockStates = MapF.fromList (MapF.Pair IR.BaseRepr baseState : blockStates)
-                 , cCFG = cfg
-                 , cVertexMap = vm
-                 , cSelectedBlock = Just (minimum (Map.elems vm))
+  let fh = CA.blockFunction b
+  let (baseCFG, baseVertexMap) = mkCFG (CA.functionBlocks ares fh)
+  let baseFunctionState = FunctionState { cSelectedBlock = Nothing
+                                        , cCFG = baseCFG
+                                        , cVertexMap = baseVertexMap
+                                        }
+  funcStates <- catMaybes <$> mapM (\(CA.SomeIRRepr rep) -> makeFunctionState tcache ares fh rep) supportedIRs
+
+  return Context { cBlockStates = MapF.fromList (MapF.Pair IR.BaseRepr baseState : blockStates)
+                 , cFunctionState = MapF.fromList (MapF.Pair IR.BaseRepr baseFunctionState : funcStates)
                  }
+
+makeFunctionState :: (CA.Architecture arch s, Ord (CA.Address ir s))
+                  => TC.TranslationCache arch s
+                  -> CA.AnalysisResult arch s
+                  -> CA.FunctionHandle arch s
+                  -- ^ The handle to the base IR function to construct a state for
+                  -> IR.IRRepr arch ir
+                  -- ^ The IR to construct a state for
+                  -> IO (Maybe (MapF.Pair (IR.IRRepr arch) (FunctionState s)))
+makeFunctionState tcache ares fh repr = do
+  mblks <- TC.translateFunctionBlocks tcache ares repr fh
+  case mblks of
+    Nothing -> return Nothing
+    Just (blks, _blkMapping) -> do
+      let (g, addrMap) = mkCFG blks
+      let fs = FunctionState { cSelectedBlock = Nothing
+                             , cCFG = g
+                             , cVertexMap = addrMap
+                             }
+      return (Just (MapF.Pair repr fs))
 
 -- | Build a CFG for the function viewer
 --
--- FIXME: The connectivity between blocks is currently not correct
-mkCFG :: (CA.Architecture arch s)
-      => CA.AnalysisResult arch s
-      -> CA.FunctionHandle arch s
-      -> (H.PatriciaTree (CA.Block arch s) (), Map.Map (CA.Address arch s) H.Vertex)
-mkCFG ares fh = (gr, vm)
+-- FIXME: The connectivity between blocks is currently not correct.  To fix it,
+-- we'll need an abstraction for computing connectivity (successors) at the
+-- Architcture.Class.Block level.
+mkCFG :: (Ord (CA.Address ir s))
+      => [CA.Block ir s]
+      -> (H.PatriciaTree (CA.Block ir s) (), Map.Map (CA.Address ir s) H.Vertex)
+mkCFG blocks = (gr, vm)
   where
     (_, gr, vm) = foldr addBlock (Nothing, H.emptyGraph, Map.empty) blocks
-    blocks = CA.functionBlocks ares fh
     addBlock b (mpred, g, m) =
       let (v, g') = H.insertLabeledVertex g b
           vm' = Map.insert (CA.blockAddress b) v m
@@ -225,9 +266,6 @@ makeBlockState tcache ares origBlock rep = do
 
 contextBlockStates :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (BlockState arch s))
 contextBlockStates = GL.field @"cBlockStates"
-
-contextFocusedBlock :: L.Getter (Context arch s) (CA.Block arch s)
-contextFocusedBlock = L.to cBaseBlock
 
 blockStateBlock :: L.Getter (BlockState arch s ir) (CA.Block ir s)
 blockStateBlock = L.to bsBlock
@@ -381,20 +419,26 @@ applyUntil p op z = fromMaybe (Just z) $ do
      | otherwise -> return (applyUntil p op nz)
 
 
-moveBlockSelection :: (H.PatriciaTree (CA.Block arch s) () -> H.Vertex -> [H.Vertex])
+moveBlockSelection :: (H.PatriciaTree (CA.Block ir s) () -> H.Vertex -> [H.Vertex])
+                   -> IR.IRRepr arch ir
                    -> ContextStack arch s
                    -> ContextStack arch s
-moveBlockSelection succOrPred cs0
-  | Just ctx <- cs0 ^? currentContext =
-      case ctx ^. selectedBlockL of
-        Nothing -> cs0 & currentContext . selectedBlockL .~ Just (minimum (Map.elems (ctx ^. vertexMapG)))
-        Just v -> cs0 & currentContext . selectedBlockL .~ listToMaybe (succOrPred (ctx ^. cfgG) v)
+moveBlockSelection succOrPred irep cs0
+  | Just ctx <- cs0 ^? currentContext
+  , Just fstate <- MapF.lookup irep (ctx ^. functionStateL) =
+      case fstate ^. selectedBlockL of
+        Nothing ->
+          let nextSel = Just (minimum (Map.elems (fstate ^. vertexMapG)))
+          in cs0 & currentContext . functionStateL %~ MapF.insert irep (fstate & selectedBlockL .~ nextSel)
+        Just v ->
+          let nextSel = listToMaybe (succOrPred (fstate ^. cfgG) v)
+          in cs0 & currentContext . functionStateL %~ MapF.insert irep (fstate & selectedBlockL .~ nextSel)
   | otherwise = cs0
 
-selectNextBlock :: ContextStack arch s -> ContextStack arch s
+selectNextBlock :: IR.IRRepr arch ir -> ContextStack arch s -> ContextStack arch s
 selectNextBlock = moveBlockSelection H.successors
 
-selectPreviousBlock :: ContextStack arch s -> ContextStack arch s
+selectPreviousBlock :: IR.IRRepr arch ir -> ContextStack arch s -> ContextStack arch s
 selectPreviousBlock = moveBlockSelection H.predecessors
 
 -- | The underlying logic for selecting the next or previous instruction

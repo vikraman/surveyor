@@ -28,6 +28,7 @@ import           Control.DeepSeq ( NFData, rnf )
 import           Control.Lens ( (^?), (^.) )
 import           Control.Monad.IO.Class ( liftIO )
 import qualified Data.Graph.Haggle as H
+import qualified Data.Parameterized.Map as MapF
 import qualified Data.Text as T
 import qualified Fmt as Fmt
 import           Fmt ( (+|), (|+) )
@@ -38,28 +39,29 @@ import qualified Surveyor.Core as C
 import           Surveyor.Brick.Names ( Names(..) )
 
 
-data FunctionViewer arch s = FunctionViewer (C.Block arch s -> IO ()) Names
+data FunctionViewer arch s ir = FunctionViewer (C.Block ir s -> IO ()) Names (C.IRRepr arch ir)
   deriving (Generic)
 
-instance NFData (FunctionViewer arch s) where
-  rnf (FunctionViewer _ !_names) = ()
+instance NFData (FunctionViewer arch s ir) where
+  rnf (FunctionViewer _ !_names !_repr) = ()
 
-functionViewer :: (C.Block arch s -> IO ()) -> Names -> (FunctionViewer arch s)
+functionViewer :: (C.Block ir s -> IO ()) -> Names -> C.IRRepr arch ir -> (FunctionViewer arch s ir)
 functionViewer = FunctionViewer
 
 handleFunctionViewerEvent :: (C.Architecture arch s)
                           => V.Event
-                          -> FunctionViewer arch s
+                          -> FunctionViewer arch s ir
                           -> C.ContextStack arch s
                           -> B.EventM Names (C.ContextStack arch s)
-handleFunctionViewerEvent evt (FunctionViewer selectBlock _name) cstk =
+handleFunctionViewerEvent evt (FunctionViewer selectBlock _name repr) cstk =
   case evt of
-    V.EvKey V.KDown [] -> return (C.selectNextBlock cstk)
-    V.EvKey V.KUp [] -> return (C.selectPreviousBlock cstk)
+    V.EvKey V.KDown [] -> return (C.selectNextBlock repr cstk)
+    V.EvKey V.KUp [] -> return (C.selectPreviousBlock repr cstk)
     V.EvKey V.KEnter []
       | Just ctx <- cstk ^? C.currentContext
-      , Just selVert <- ctx ^. C.selectedBlockL
-      , Just selBlock <- H.vertexLabel (ctx ^. C.cfgG) selVert -> do
+      , Just funcState <- MapF.lookup repr (ctx ^. C.functionStateL)
+      , Just selVert <- funcState ^. C.selectedBlockL
+      , Just selBlock <- H.vertexLabel (funcState ^. C.cfgG) selVert -> do
           -- Either send a message (probably put the callback function in the
           -- FunctionViewer constructor) or construct the new context here
           liftIO (selectBlock selBlock)
@@ -67,15 +69,16 @@ handleFunctionViewerEvent evt (FunctionViewer selectBlock _name) cstk =
       | otherwise -> return cstk
     _ -> return cstk
 
-renderFunctionViewer :: (C.Architecture arch s, Eq (C.Address arch s))
+renderFunctionViewer :: (C.Architecture arch s, Eq (C.Address arch s), C.IR ir s)
                      => C.AnalysisResult arch s
                      -> C.ContextStack arch s
-                     -> FunctionViewer arch s
+                     -> FunctionViewer arch s ir
                      -> B.Widget Names
-renderFunctionViewer _ares cstk (FunctionViewer _ names)
-  | Just ctx <- cstk ^? C.currentContext =
-      let cfg = ctx ^. C.cfgG
-          selectedBlock = ctx ^. C.selectedBlockL
+renderFunctionViewer _ares cstk (FunctionViewer _ names repr)
+  | Just ctx <- cstk ^? C.currentContext
+  , Just funcState <- MapF.lookup repr (ctx ^. C.functionStateL) =
+      let cfg = funcState ^. C.cfgG
+          selectedBlock = funcState ^. C.selectedBlockL
           gr = BG.graph names cfg selectedBlock 2
       in BG.renderGraph renderNode renderEdge gr
   | otherwise = B.txt (T.pack "No function")
@@ -90,3 +93,7 @@ renderNode isFocused b =
 
 renderEdge :: () -> B.Widget Names
 renderEdge _el = B.emptyWidget
+
+{- IDEA: Add the ability to switch between IR views at the function level using the new asAlternativeIR to list all blocks
+
+-}

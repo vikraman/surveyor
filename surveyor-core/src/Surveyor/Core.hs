@@ -93,7 +93,6 @@ module Surveyor.Core (
   CCX.contextForward,
   -- ** Lenses
   CCX.currentContext,
-  CCX.contextFocusedBlock,
   CCX.blockStateFor,
   CCX.blockStateList,
   CCX.blockStateBlock,
@@ -101,6 +100,7 @@ module Surveyor.Core (
   CCX.cfgG,
   CCX.vertexMapG,
   CCX.selectedBlockL,
+  CCX.functionStateL,
   -- * Translation Cache
   TC.TranslationCache,
   TC.newTranslationCache,

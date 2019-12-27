@@ -113,8 +113,11 @@ handleVtyEvent s0@(C.State s) evt
           let s' = s & C.lArchState . _Just . functionSelectorL .~ fsel'
           B.continue $! C.State s'
       | otherwise -> B.continue s0
-    C.SomeUIMode C.FunctionViewer
-      | Just fview <- s ^? C.lArchState . _Just . functionViewerL
+    C.SomeUIMode (C.FunctionViewer fvNonce rep)
+      | Just Refl <- testEquality fvNonce (s ^. C.lNonce)
+      , Just archState <- s ^. C.lArchState
+      , Just fview <- archState ^. functionViewerG rep
+      -- | Just fview <- s ^? C.lArchState . _Just . functionViewerG rep . _Just
       , Just cstk <- s ^? C.lArchState . _Just . C.contextL -> do
           cstk' <- FV.handleFunctionViewerEvent evt fview cstk
           let s' = s & C.lArchState . _Just . C.contextL .~ cstk'
@@ -199,8 +202,8 @@ handleCustomEvent s0 evt =
           let s1 = s0 & C.lUIMode .~ C.SomeUIMode (C.BlockViewer archNonce rep)
           B.continue $! C.State s1
       | otherwise -> B.continue (C.State s0)
-    C.ViewFunction _archNonce -> do
-      let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.FunctionViewer
+    C.ViewFunction archNonce rep -> do
+      let s1 = s0 & C.lUIMode .~ C.SomeUIMode (C.FunctionViewer archNonce rep)
       B.continue $! C.State s1
     C.ViewInstructionSemantics _archNonce -> do
       let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.SemanticsViewer
@@ -273,7 +276,7 @@ handleCustomEvent s0 evt =
           liftIO (C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogDebug) (Fmt.fmt ("Finding block at address " +| C.prettyAddress addr |+ ""))))
           case C.containingBlocks ares addr of
             [b] -> do
-              liftIO (C.sEmitEvent s0 (C.PushContext archNonce b))
+              liftIO (C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr b))
               liftIO (C.sEmitEvent s0 (C.ViewBlock archNonce C.BaseRepr))
               B.continue (C.State s0)
             blocks -> do
@@ -283,7 +286,7 @@ handleCustomEvent s0 evt =
     C.ListBlocks archNonce blocks
       | Just Refl <- testEquality (s0 ^. C.lNonce) archNonce -> do
           let callback b = do
-                C.sEmitEvent s0 (C.PushContext archNonce b)
+                C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr b)
                 C.logDiagnostic s0 C.LogDebug (Fmt.fmt ("Pushing a block to view: " +| C.blockAddress b ||+""))
                 C.sEmitEvent s0 (C.ViewBlock archNonce C.BaseRepr)
           let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.BlockSelector
@@ -310,14 +313,14 @@ handleCustomEvent s0 evt =
                     C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogWarning) (Fmt.fmt ("Failed to find blocks for function: " +| f ||+"")))
                   entryBlock : _ -> do
                     C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogDebug) (Fmt.fmt ("Selecting function: " +| f ||+ "")))
-                    C.sEmitEvent s0 (C.PushContext archNonce entryBlock)
-                    C.sEmitEvent s0 (C.ViewFunction archNonce)
+                    C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr entryBlock)
+                    C.sEmitEvent s0 (C.ViewFunction archNonce C.BaseRepr)
           let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.FunctionSelector
                       & C.lArchState . _Just . functionSelectorL .~ FS.functionSelector callback focusedListAttr funcs
           B.continue (C.State s1)
       | otherwise -> B.continue (C.State s0)
 
-    C.PushContext archNonce b
+    C.PushContext archNonce _irrepr b
       | Just archState <- s0 ^. C.lArchState
       , Just Refl <- testEquality (s0 ^. C.lNonce) archNonce -> do
           ctx <- liftIO $ C.makeContext (archState ^. C.irCacheL) (archState ^. C.lAnalysisResult) b
@@ -442,12 +445,17 @@ stateFromAnalysisResult s0 ares newDiags state uiMode = do
                                          : [ MapF.Pair rep (BV.blockViewer InteractiveBlockViewer rep)
                                            | C.SomeIRRepr rep <- C.alternativeIRs (Proxy @(arch, s))
                                            ]
-                        let funcViewerCallback b = do
-                              C.sEmitEvent s0 (C.PushContext (C.archNonce ares) b)
-                              C.sEmitEvent s0 (C.ViewBlock (C.archNonce ares) C.BaseRepr)
+                        let funcViewerCallback :: forall ir . C.IRRepr arch ir -> C.Block ir s -> IO ()
+                            funcViewerCallback rep b = do
+                              C.sEmitEvent s0 (C.PushContext (C.archNonce ares) rep b)
+                              C.sEmitEvent s0 (C.ViewBlock (C.archNonce ares) rep)
+                        let funcViewers = (MapF.Pair C.BaseRepr (FV.functionViewer (funcViewerCallback C.BaseRepr) FunctionCFGViewer C.BaseRepr))
+                                          : [ MapF.Pair rep (FV.functionViewer (funcViewerCallback rep) FunctionCFGViewer rep)
+                                            | C.SomeIRRepr rep <- C.alternativeIRs (Proxy @(arch, s))
+                                            ]
                         let uiState = BrickUIState { sBlockSelector = BS.emptyBlockSelector
                                                    , sBlockViewers = MapF.fromList blockViewers
-                                                   , sFunctionViewer = FV.functionViewer funcViewerCallback FunctionCFGViewer
+                                                   , sFunctionViewer = MapF.fromList funcViewers
                                                    , sFunctionSelector = FS.functionSelector (const (return ())) focusedListAttr []
                                                    }
                         return C.ArchState { C.sAnalysisResult = ares
@@ -504,7 +512,7 @@ data BrickUIState arch s =
                -- ^ Functions available in the function selector
                , sBlockSelector :: !(BS.BlockSelector arch s)
                , sBlockViewers :: !(MapF.MapF (C.IRRepr arch) (BV.BlockViewer arch s))
-               , sFunctionViewer :: !(FV.FunctionViewer arch s)
+               , sFunctionViewer :: !(MapF.MapF (C.IRRepr arch) (FV.FunctionViewer arch s))
                }
   deriving (Generic)
 
@@ -553,9 +561,8 @@ blockViewersL = C.lUIState . GL.field @"sBlockViewers"
 blockViewerG :: C.IRRepr arch ir -> L.Getter (C.ArchState BrickUIState arch s) (Maybe (BV.BlockViewer arch s ir))
 blockViewerG rep = L.to (\as -> MapF.lookup rep (as ^. blockViewersL))
 
-functionViewerL :: L.Lens' (C.ArchState BrickUIState arch s) (FV.FunctionViewer arch s)
-functionViewerL = C.lUIState . GL.field @"sFunctionViewer"
+functionViewersL :: L.Lens' (C.ArchState BrickUIState arch s) (MapF.MapF (C.IRRepr arch) (FV.FunctionViewer arch s))
+functionViewersL = C.lUIState . GL.field @"sFunctionViewer"
 
-functionViewerG :: L.Getter (C.ArchState BrickUIState arch s) (FV.FunctionViewer arch s)
-functionViewerG = L.to (^. functionViewerL)
-
+functionViewerG :: C.IRRepr arch ir -> L.Getter (C.ArchState BrickUIState arch s) (Maybe (FV.FunctionViewer arch s ir))
+functionViewerG rep = L.to (\as -> MapF.lookup rep (as ^. functionViewersL))
