@@ -100,7 +100,7 @@ module Surveyor.Core (
   CCX.cfgG,
   CCX.vertexMapG,
   CCX.selectedBlockL,
-  CCX.functionStateL,
+  CCX.functionStateFor,
   -- * Translation Cache
   TC.TranslationCache,
   TC.newTranslationCache,

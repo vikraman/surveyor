@@ -32,7 +32,7 @@ module Surveyor.Core.Context (
   blockStateList,
   blockStateBlock,
   blockStateSelection,
-  functionStateL,
+  functionStateFor,
   vertexMapG,
   cfgG,
   selectedBlockL
@@ -48,7 +48,7 @@ import qualified Data.Foldable as F
 import qualified Data.Generics.Product as GL
 import qualified Data.Graph.Haggle as H
 import qualified Data.Map as Map
-import           Data.Maybe ( catMaybes, fromMaybe, listToMaybe, mapMaybe )
+import           Data.Maybe ( catMaybes, fromMaybe, listToMaybe, mapMaybe, maybeToList )
 import           Data.Parameterized.Classes ( testEquality, (:~:)(Refl), atF )
 import qualified Data.Parameterized.Map as MapF
 import qualified Data.Parameterized.TraversableF as TF
@@ -61,10 +61,6 @@ import qualified Surveyor.Core.Architecture as CA
 import qualified Surveyor.Core.IRRepr as IR
 import qualified Surveyor.Core.TranslationCache as TC
 
--- | The current context can either be a Function or a Block (for a given IR)
-data Context arch s where
-  FunctionContext :: IR.IRRepr arch ir -> FunctionState s ir -> Context arch s
-  BlockContext :: IR.IRRepr arch ir -> BlockState arch s ir -> Context arch s
 
 -- | A context focused (at some point) by the user, and used to inform drawing
 -- of various widgets.
@@ -86,62 +82,50 @@ data Context arch s where
 -- function" or "pop to previous block", which are linear (but not too
 -- expensive) operations.
 data Context arch s =
-  Context { cFocusedObject :: FocusedObject arch s
-          , cBlockStates :: MapF.MapF (IR.IRRepr arch) (BlockState arch s)
+  Context { cBlockState :: MapF.MapF (IR.IRRepr arch) (BlockState arch s)
           -- ^ The set of instructions selected for each IR.  This should always
           -- be updated all at once to ensure consistency.
-          , cFunctionState :: MapF.MapF (IR.IRRepr arch) (FunctionState s)
+          , cFunctionState :: MapF.MapF (IR.IRRepr arch) (FunctionState arch s)
           -- ^ State information for the currently-selected function (in each IR)
           }
-{-
-          , cSelectedBlock :: Maybe H.Vertex
-          -- ^ For the function viewer, which block is selected.
-          , cCFG :: H.PatriciaTree (CA.Block arch s) ()
-          -- ^ The CFG of the function containing this block
-          --
-          -- FIXME: Come up with a nice way to re-use this when possible.
-          --
-          -- IDEA: Make pushContext only take a block, and re-use anything we
-          -- can.  This will work, but requires a bit more API tweaking to let
-          -- us compute something expensive (the new context) in a separate
-          -- thread *and then* send a message when it is merged into the main state.
-          , cVertexMap :: Map.Map (CA.Address arch s) H.Vertex
-          }
--}
   deriving (Generic)
 
-data FunctionState s ir =
-  FunctionState { cSelectedBlock :: Maybe H.Vertex
+data FunctionState arch s ir =
+  FunctionState { fsSelectedBlock :: Maybe H.Vertex
                 -- ^ The currently-selected block for this IR, if any
-                , cCFG :: H.PatriciaTree (CA.Block ir s) ()
+                , fsCFG :: H.PatriciaTree (CA.Block ir s) ()
                 -- ^ The CFG of the current function
                 --
                 -- FIXME: Try to cache these somewhere
-                , cVertexMap :: Map.Map (CA.Address ir s) H.Vertex
+                , fsVertexMap :: Map.Map (CA.Address ir s) H.Vertex
                 -- ^ A mapping from block addresses to vertices
+                , fsBaseFunction :: CA.FunctionHandle arch s
+                -- ^ The base function that this block corresponds to
+                , fsWithConstraints :: forall a . (CA.ArchConstraints ir s => a) -> a
                 }
 
-functionStateL :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (FunctionState s))
+functionStateL :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (FunctionState arch s))
 functionStateL = GL.field @"cFunctionState"
 
-vertexMapG :: L.Getter (FunctionState s ir) (Map.Map (CA.Address ir s) H.Vertex)
-vertexMapG = L.to cVertexMap
+vertexMapG :: L.Getter (FunctionState arch s ir) (Map.Map (CA.Address ir s) H.Vertex)
+vertexMapG = L.to fsVertexMap
 
-cfgG :: L.Getter (FunctionState s ir) (H.PatriciaTree (CA.Block ir s) ())
-cfgG = L.to cCFG
+cfgG :: L.Getter (FunctionState arch s ir) (H.PatriciaTree (CA.Block ir s) ())
+cfgG = L.to fsCFG
 
-selectedBlockL :: L.Lens' (FunctionState s ir) (Maybe H.Vertex)
-selectedBlockL f fs = fmap (\sb' -> fs { cSelectedBlock = sb' }) (f (cSelectedBlock fs))
+selectedBlockL :: L.Lens' (FunctionState arch s ir) (Maybe H.Vertex)
+selectedBlockL f fs = fmap (\sb' -> fs { fsSelectedBlock = sb' }) (f (fsSelectedBlock fs))
 
 instance (CA.ArchConstraints arch s) => NFData (Context arch s) where
-  rnf c = TF.toListF forceFunctionState (cFunctionState c) `deepseq` TF.toListF forceBlockState (cBlockStates c) `deepseq` ()
+  rnf c = TF.toListF forceFunctionState (cFunctionState c) `deepseq` TF.toListF forceBlockState (cBlockState c) `deepseq` ()
 
 forceBlockState :: BlockState arch s ir -> ()
-forceBlockState bs@BlockState { withConstraints = withC } =
+forceBlockState bs@BlockState { bsWithConstraints = withC } =
   withC (bsBlock bs `deepseq` bsSelection bs `deepseq` bsList bs `deepseq` ())
 
-forceFunctionState :: FunctionState s ir -> ()
-forceFunctionState fs = cSelectedBlock fs `deepseq` cCFG fs `deepseq` cVertexMap fs `deepseq` ()
+forceFunctionState :: FunctionState arch s ir -> ()
+forceFunctionState fs@(FunctionState { fsWithConstraints = withC }) =
+  withC (fsSelectedBlock fs `deepseq` fsCFG fs `deepseq` fsVertexMap fs `deepseq` ())
 
 data BlockState arch s ir =
   BlockState { bsBlock :: CA.Block ir s
@@ -160,7 +144,7 @@ data BlockState arch s ir =
              -- 1) The Base IR won't have one
              --
              -- 2) Translation could fail for a block
-             , withConstraints :: forall a . (CA.ArchConstraints ir s => a) -> a
+             , bsWithConstraints :: forall a . (CA.ArchConstraints ir s => a) -> a
              -- ^ A way to recover the 'CA.ArchConstraints' dictionary
              , bsRepr :: IR.IRRepr arch ir
              }
@@ -168,54 +152,83 @@ data BlockState arch s ir =
 -- | Make a 'CA.Context' given a 'CA.FunctionHandle' and a 'CA.Block'
 --
 -- For each available alternative IR, sets up the appropriate 'CA.Block States'
-makeContext :: forall arch s
-             . (CA.Architecture arch s)
+--
+-- If the requested IR is not the base, don't populate any of the translation
+-- stuff (or extra block IRs)
+--
+-- FIXME: We call this whenever we push a new context.  Each new context is for
+-- a specific block in one function.  At the top level, we have to compute the
+-- list of alternative-IR blocks so that we can pass them as inputs to
+-- makeBlockState.  Don't bother for non-base IRs - just make a single block for
+-- those
+makeContext :: forall arch s ir
+             . (CA.Architecture arch s, CA.ArchConstraints ir s)
             => TC.TranslationCache arch s
             -> CA.AnalysisResult arch s
+            -> CA.FunctionHandle arch s
+            -> IR.IRRepr arch ir
+            -> CA.Block ir s
             -> IO (Context arch s)
-makeContext tcache ares = do
-  let supportedIRs = CA.alternativeIRs (Proxy @(arch, s))
-  blockStates <- catMaybes <$> mapM (\(CA.SomeIRRepr rep) -> makeBlockState tcache ares rep) supportedIRs
-  let baseState = BlockState { bsBlock = b
-                             , bsSelection = NoSelection
-                             , bsList = V.fromList [ (ix, addr, i)
-                                                   | (ix, (addr, i)) <- zip [0..] (CA.blockInstructions b)
-                                                   ]
-                             , bsBlockMapping = Nothing
-                             , withConstraints = \a -> a
-                             , bsRepr = IR.BaseRepr
-                             }
-  let fh = CA.blockFunction b
-  let (baseCFG, baseVertexMap) = mkCFG (CA.functionBlocks ares fh)
-  let baseFunctionState = FunctionState { cSelectedBlock = Nothing
-                                        , cCFG = baseCFG
-                                        , cVertexMap = baseVertexMap
-                                        }
-  funcStates <- catMaybes <$> mapM (\(CA.SomeIRRepr rep) -> makeFunctionState tcache ares fh rep) supportedIRs
+makeContext tcache ares fh irrepr b =
+  case irrepr of
+    IR.BaseRepr -> do
+      let supportedIRs = CA.alternativeIRs (Proxy @(arch, s))
+      let makeIRBlock (CA.SomeIRRepr rep) = do
+            mbs <- makeBlockState tcache ares fh b rep
+            case mbs of
+              Nothing -> return Nothing
+              Just bs -> return (Just (MapF.Pair rep bs))
+      blockStates <- catMaybes <$> mapM makeIRBlock supportedIRs
+      let baseState = BlockState { bsBlock = b
+                                 , bsSelection = NoSelection
+                                 , bsList = V.fromList [ (ix, addr, i)
+                                                       | (ix, (addr, i)) <- zip [0..] (CA.blockInstructions b)
+                                                       ]
+                                 , bsBlockMapping = Nothing
+                                 , bsWithConstraints = \a -> a
+                                 , bsRepr = IR.BaseRepr
+                                 }
+      let (baseCFG, baseVertexMap) = mkCFG (CA.functionBlocks ares fh)
+      let baseFunctionState = FunctionState { fsSelectedBlock = Nothing
+                                            , fsCFG = baseCFG
+                                            , fsVertexMap = baseVertexMap
+                                            , fsBaseFunction = fh
+                                            , fsWithConstraints = \a -> a
+                                            }
+      let makeIRFunction (CA.SomeIRRepr rep) = fmap (MapF.Pair rep) <$> makeFunctionState tcache ares fh rep
+      funcStates <- catMaybes <$> mapM makeIRFunction supportedIRs
 
-  return Context { cBlockStates = MapF.fromList (MapF.Pair IR.BaseRepr baseState : blockStates)
-                 , cFunctionState = MapF.fromList (MapF.Pair IR.BaseRepr baseFunctionState : funcStates)
-                 }
+      return Context { cBlockState = MapF.fromList (MapF.Pair IR.BaseRepr baseState : blockStates)
+                     , cFunctionState = MapF.fromList (MapF.Pair IR.BaseRepr baseFunctionState : funcStates)
+                     }
+    _ -> do
+      bs <- makeAlternativeBlockState b irrepr
+      mfs <- fmap (MapF.Pair irrepr) <$> makeFunctionState tcache ares fh irrepr
+      return Context { cBlockState = MapF.fromList [ MapF.Pair irrepr bs ]
+                     , cFunctionState = MapF.fromList (maybeToList mfs)
+                     }
 
-makeFunctionState :: (CA.Architecture arch s, Ord (CA.Address ir s))
+makeFunctionState :: (CA.Architecture arch s, CA.ArchConstraints ir s)
                   => TC.TranslationCache arch s
                   -> CA.AnalysisResult arch s
                   -> CA.FunctionHandle arch s
                   -- ^ The handle to the base IR function to construct a state for
                   -> IR.IRRepr arch ir
                   -- ^ The IR to construct a state for
-                  -> IO (Maybe (MapF.Pair (IR.IRRepr arch) (FunctionState s)))
+                  -> IO (Maybe (FunctionState arch s ir))
 makeFunctionState tcache ares fh repr = do
   mblks <- TC.translateFunctionBlocks tcache ares repr fh
   case mblks of
     Nothing -> return Nothing
     Just (blks, _blkMapping) -> do
       let (g, addrMap) = mkCFG blks
-      let fs = FunctionState { cSelectedBlock = Nothing
-                             , cCFG = g
-                             , cVertexMap = addrMap
+      let fs = FunctionState { fsSelectedBlock = Nothing
+                             , fsCFG = g
+                             , fsVertexMap = addrMap
+                             , fsBaseFunction = fh
+                             , fsWithConstraints = \a -> a
                              }
-      return (Just (MapF.Pair repr fs))
+      return (Just fs)
 
 -- | Build a CFG for the function viewer
 --
@@ -236,36 +249,54 @@ mkCFG blocks = (gr, vm)
         (_, g'') <- H.insertLabeledEdge g' p v ()
         return (Just v, g'', vm')
 
+toInstructionList :: CA.Block ir s
+                  -> V.Vector (Int, CA.Address ir s, CA.Instruction ir s)
+toInstructionList block =
+  V.fromList indexedAddrs
+  where
+    indexedAddrs = [ (ix, addr, i)
+                   | (ix, (addr, i)) <- zip [0..] (CA.blockInstructions block)
+                   ]
+
+makeAlternativeBlockState :: (Monad m, CA.ArchConstraints ir s)
+                          => CA.Block ir s
+                          -> IR.IRRepr arch ir
+                          -> m (BlockState arch s ir)
+makeAlternativeBlockState block rep =
+  return BlockState { bsSelection = NoSelection
+                    , bsBlock = block
+                    , bsList = toInstructionList block
+                    , bsRepr = rep
+                    , bsWithConstraints = \a -> a
+                    , bsBlockMapping = Nothing
+                    }
+
 makeBlockState :: forall arch ir s
                 . (CA.Architecture arch s, CA.ArchConstraints ir s)
                => TC.TranslationCache arch s
                -> CA.AnalysisResult arch s
+               -> CA.FunctionHandle arch s
                -> CA.Block arch s
                -- ^ The original block that we want the alternative representation for
                -> IR.IRRepr arch ir
-               -> IO (Maybe (MapF.Pair (IR.IRRepr arch) (BlockState arch s)))
-makeBlockState tcache ares origBlock rep = do
+               -> IO (Maybe (BlockState arch s ir))
+makeBlockState tcache ares fh origBlock rep = do
   mBlockMapping <- TC.translateFunctionBlocks tcache ares rep fh
   return $ do
     bm <- mBlockMapping
     (_, trBlock) <- Map.lookup (CA.blockAddress origBlock) (CA.blockMapping (snd bm))
-    let insnList = [ (ix, addr, i)
-                   | (ix, (addr, i)) <- zip [0..] (CA.blockInstructions trBlock)
-                   ]
     let bs :: BlockState arch s ir
         bs = BlockState { bsSelection = NoSelection
                         , bsBlock = trBlock
-                        , bsList = V.fromList insnList
+                        , bsList = toInstructionList trBlock
                         , bsBlockMapping = Just (snd bm)
-                        , withConstraints = \a -> a
+                        , bsWithConstraints = \a -> a
                         , bsRepr = rep
                         }
-    return (MapF.Pair rep bs)
-  where
-    fh = CA.blockFunction origBlock
+    return bs
 
-contextBlockStates :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (BlockState arch s))
-contextBlockStates = GL.field @"cBlockStates"
+blockStateL :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (BlockState arch s))
+blockStateL = GL.field @"cBlockState"
 
 blockStateBlock :: L.Getter (BlockState arch s ir) (CA.Block ir s)
 blockStateBlock = L.to bsBlock
@@ -348,12 +379,15 @@ currentContext f cs
   | otherwise = pure cs
 
 blockStateFor :: IR.IRRepr arch ir -> L.Lens' (Context arch s) (Maybe (BlockState arch s ir))
-blockStateFor repr = contextBlockStates . atF repr
+blockStateFor repr = blockStateL . atF repr
+
+functionStateFor :: IR.IRRepr arch ir -> L.Lens' (Context arch s) (Maybe (FunctionState arch s ir))
+functionStateFor repr = functionStateL . atF repr
 
 -- | Clear the selection of any individual instruction or operand from the current 'Context'
 resetBlockSelection :: ContextStack arch s -> ContextStack arch s
 resetBlockSelection cs =
-  cs & currentContext . contextBlockStates %~ TF.fmapF clearSel
+  cs & currentContext . blockStateL %~ TF.fmapF clearSel
   where
     clearSel bs = bs & blockStateSelection .~ NoSelection
 
@@ -376,11 +410,11 @@ selectPreviousInstruction = moveInstructionSelection (\_nInsns n -> max 0 (n - 1
 -- | If possible, move the operand selection to the right by one
 selectNextOperand :: (CA.IR ir s) => IR.IRRepr arch ir -> ContextStack arch s -> ContextStack arch s
 selectNextOperand repr cs =
-  cs & currentContext . contextBlockStates . atF repr %~ modifyOperandSelection CA.zipperNext
+  cs & currentContext . blockStateL . atF repr %~ modifyOperandSelection CA.zipperNext
 
 selectPreviousOperand :: (CA.IR ir s) => IR.IRRepr arch ir -> ContextStack arch s -> ContextStack arch s
 selectPreviousOperand repr cs =
-  cs & currentContext . contextBlockStates . atF repr %~ modifyOperandSelection CA.zipperPrev
+  cs & currentContext . blockStateL . atF repr %~ modifyOperandSelection CA.zipperPrev
 
 modifyOperandSelection :: (CA.IR ir s)
                        => (forall a . CA.Zipper a -> Maybe (CA.Zipper a))
@@ -453,10 +487,10 @@ moveInstructionSelection :: (Ord (CA.Address ir s), Ord (CA.Address arch s), Sho
                          -> ContextStack arch s
                          -> ContextStack arch s
 moveInstructionSelection modSel repr cs0 =
-  cs2 & currentContext . contextBlockStates %~ TF.fmapF (syncOtherStates repr (cs2 ^? currentContext . contextBlockStates))
+  cs2 & currentContext . blockStateL %~ TF.fmapF (syncOtherStates repr (cs2 ^? currentContext . blockStateL))
   where
-    cs1 = cs0 & currentContext . contextBlockStates . atF repr %~ moveNext
-    cs2 = cs1 & currentContext . contextBlockStates . atF IR.BaseRepr %~ syncBaseState repr (cs1 ^? currentContext . contextBlockStates)
+    cs1 = cs0 & currentContext . blockStateL . atF repr %~ moveNext
+    cs2 = cs1 & currentContext . blockStateL . atF IR.BaseRepr %~ syncBaseState repr (cs1 ^? currentContext . blockStateL)
     moveNext Nothing = Nothing
     moveNext (Just bs) = Just (bs & blockStateSelection %~ modifySelection modSel bs)
 
@@ -533,7 +567,7 @@ syncOtherStates :: (Ord (CA.Address arch s), Show (CA.Address arch s))
 syncOtherStates updatedIR mBlkStMap bs
   | Just Refl <- testEquality updatedIR (bsRepr bs) = bs
   | Just Refl <- testEquality IR.BaseRepr (bsRepr bs) = bs
-  | otherwise = withConstraints bs $ fromMaybe bs $ do
+  | otherwise = bsWithConstraints bs $ fromMaybe bs $ do
       blkStMap <- mBlkStMap
       -- The Base IR has been synced to whatever the update was, so we can use
       -- 'baseToIRAddrs' (of *bs*) to figure out what should be selected.
@@ -553,7 +587,7 @@ syncOtherStates updatedIR mBlkStMap bs
           let irAddrs = Set.unions (mapMaybe (\a -> Map.lookup a (CA.baseToIRAddrs bm)) oldIRSels)
           makeNextSelection irAddrs
   where
-    makeNextSelection irAddrs = withConstraints bs $
+    makeNextSelection irAddrs = bsWithConstraints bs $
       case F.foldr (addSelectedAddrs irAddrs) [] (bsList bs) of
         [] -> return bs
         [(singIx, singAddr)] ->
