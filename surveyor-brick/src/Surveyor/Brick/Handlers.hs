@@ -474,6 +474,9 @@ stateFromAnalysisResult s0 ares newDiags state uiMode = do
     modeKeys = [ blockViewerKeys (C.archNonce ares) C.BaseRepr
                , blockViewerKeys (C.archNonce ares) C.MacawRepr
                , blockViewerKeys (C.archNonce ares) C.CrucibleRepr
+               , functionViewerKeys (C.archNonce ares) C.BaseRepr
+               , functionViewerKeys (C.archNonce ares) C.MacawRepr
+               , functionViewerKeys (C.archNonce ares) C.CrucibleRepr
                ]
     addModeKeys (mode, keys) modeKeymap =
       foldr (\(k, C.SomeCommand cmd) -> C.addModeKey mode k cmd) modeKeymap keys
@@ -489,6 +492,16 @@ updateMinibufferCompletions emitEvent archNonce = \t matches -> do
           state & C.lUIExtension . minibufferL %~ MBW.setCompletions matches'
         | otherwise = state
   emitEvent (C.AsyncStateUpdate archNonce (NF.nf matches) stateTransformer)
+
+functionViewerKeys :: PN.Nonce s arch
+                   -> C.IRRepr arch ir
+                   -> (C.SomeUIMode s, [(C.Key, C.SomeCommand (C.SurveyorCommand s (C.S BrickUIExtension BrickUIState)))])
+functionViewerKeys nonce rep = ( C.SomeUIMode (C.FunctionViewer nonce rep)
+                               , [ (C.Key (V.KChar 'm') [], C.SomeCommand BC.showMacawFunctionC)
+                                 , (C.Key (V.KChar 'c') [], C.SomeCommand BC.showCrucibleFunctionC)
+                                 , (C.Key (V.KChar 'b') [], C.SomeCommand BC.showBaseFunctionC)
+                                 ]
+                               )
 
 blockViewerKeys :: PN.Nonce s arch
                 -> C.IRRepr arch ir
