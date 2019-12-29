@@ -118,7 +118,6 @@ handleVtyEvent s0@(C.State s) evt
       | Just Refl <- testEquality fvNonce (s ^. C.lNonce)
       , Just archState <- s ^. C.lArchState
       , Just fview <- archState ^. functionViewerG rep
-      -- | Just fview <- s ^? C.lArchState . _Just . functionViewerG rep . _Just
       , Just cstk <- s ^? C.lArchState . _Just . C.contextL -> do
           cstk' <- FV.handleFunctionViewerEvent evt fview cstk
           let s' = s & C.lArchState . _Just . C.contextL .~ cstk'
