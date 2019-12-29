@@ -1,9 +1,9 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
 -- | A basic function viewer
@@ -17,10 +17,9 @@ module Surveyor.Brick.Widget.FunctionViewer (
   FunctionViewer,
   functionViewer,
   handleFunctionViewerEvent,
-  renderFunctionViewer
+  renderFunctionViewer,
+  withConstraints
   ) where
-
-import           GHC.Generics ( Generic )
 
 import qualified Brick as B
 import qualified Brick.Widgets.List as B
@@ -28,7 +27,6 @@ import           Control.DeepSeq ( NFData, rnf )
 import           Control.Lens ( (^?), (^.) )
 import           Control.Monad.IO.Class ( liftIO )
 import qualified Data.Graph.Haggle as H
-import qualified Data.Parameterized.Map as MapF
 import qualified Data.Text as T
 import qualified Fmt as Fmt
 import           Fmt ( (+|), (|+) )
@@ -39,47 +37,58 @@ import qualified Surveyor.Core as C
 import           Surveyor.Brick.Names ( Names(..) )
 
 
-data FunctionViewer arch s ir = FunctionViewer (C.Block ir s -> IO ()) Names (C.IRRepr arch ir)
-  deriving (Generic)
+data FunctionViewer arch s ir =
+  FunctionViewer { fvCallback :: C.FunctionHandle arch s -> C.Block ir s -> IO ()
+                 , fvNames :: Names
+                 , fvIRRepr :: C.IRRepr arch ir
+                 , withConstraints :: forall a . ((C.IR ir s) => a) -> a
+                 }
 
 instance NFData (FunctionViewer arch s ir) where
-  rnf (FunctionViewer _ !_names !_repr) = ()
+  rnf (FunctionViewer _ !_names !_repr _) = ()
 
-functionViewer :: (C.Block ir s -> IO ()) -> Names -> C.IRRepr arch ir -> (FunctionViewer arch s ir)
-functionViewer = FunctionViewer
+functionViewer :: (C.IR ir s) => (C.FunctionHandle arch s -> C.Block ir s -> IO ()) -> Names -> C.IRRepr arch ir -> (FunctionViewer arch s ir)
+functionViewer cb names irrepr =
+  FunctionViewer { fvCallback = cb
+                 , fvNames = names
+                 , fvIRRepr = irrepr
+                 , withConstraints = \a -> a
+                 }
 
 handleFunctionViewerEvent :: (C.Architecture arch s)
                           => V.Event
                           -> FunctionViewer arch s ir
                           -> C.ContextStack arch s
                           -> B.EventM Names (C.ContextStack arch s)
-handleFunctionViewerEvent evt (FunctionViewer selectBlock _name repr) cstk =
+handleFunctionViewerEvent evt fv cstk =
   case evt of
     V.EvKey V.KDown [] -> return (C.selectNextBlock repr cstk)
     V.EvKey V.KUp [] -> return (C.selectPreviousBlock repr cstk)
     V.EvKey V.KEnter []
       | Just ctx <- cstk ^? C.currentContext
-      , Just funcState <- MapF.lookup repr (ctx ^. C.functionStateL)
+      , Just funcState <- ctx ^. C.functionStateFor repr
       , Just selVert <- funcState ^. C.selectedBlockL
       , Just selBlock <- H.vertexLabel (funcState ^. C.cfgG) selVert -> do
           -- Either send a message (probably put the callback function in the
           -- FunctionViewer constructor) or construct the new context here
-          liftIO (selectBlock selBlock)
+          liftIO (fvCallback fv (ctx ^. C.baseFunctionG) selBlock)
           return cstk
       | otherwise -> return cstk
     _ -> return cstk
+  where
+    repr = fvIRRepr fv
 
 renderFunctionViewer :: (C.Architecture arch s, Eq (C.Address arch s), C.IR ir s)
                      => C.AnalysisResult arch s
                      -> C.ContextStack arch s
                      -> FunctionViewer arch s ir
                      -> B.Widget Names
-renderFunctionViewer _ares cstk (FunctionViewer _ names repr)
+renderFunctionViewer _ares cstk fv
   | Just ctx <- cstk ^? C.currentContext
-  , Just funcState <- MapF.lookup repr (ctx ^. C.functionStateL) =
+  , Just funcState <- ctx ^. C.functionStateFor (fvIRRepr fv) =
       let cfg = funcState ^. C.cfgG
           selectedBlock = funcState ^. C.selectedBlockL
-          gr = BG.graph names cfg selectedBlock 2
+          gr = BG.graph (fvNames fv) cfg selectedBlock 2
       in BG.renderGraph renderNode renderEdge gr
   | otherwise = B.txt (T.pack "No function")
 

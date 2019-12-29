@@ -28,6 +28,7 @@ module Surveyor.Core.Context (
   contextBack,
   -- *  Lenses
   currentContext,
+  baseFunctionG,
   blockStateFor,
   blockStateList,
   blockStateBlock,
@@ -87,6 +88,7 @@ data Context arch s =
           -- be updated all at once to ensure consistency.
           , cFunctionState :: MapF.MapF (IR.IRRepr arch) (FunctionState arch s)
           -- ^ State information for the currently-selected function (in each IR)
+          , cBaseFunction :: CA.FunctionHandle arch s
           }
   deriving (Generic)
 
@@ -181,9 +183,7 @@ makeContext tcache ares fh irrepr b =
       blockStates <- catMaybes <$> mapM makeIRBlock supportedIRs
       let baseState = BlockState { bsBlock = b
                                  , bsSelection = NoSelection
-                                 , bsList = V.fromList [ (ix, addr, i)
-                                                       | (ix, (addr, i)) <- zip [0..] (CA.blockInstructions b)
-                                                       ]
+                                 , bsList = toInstructionList b
                                  , bsBlockMapping = Nothing
                                  , bsWithConstraints = \a -> a
                                  , bsRepr = IR.BaseRepr
@@ -200,12 +200,14 @@ makeContext tcache ares fh irrepr b =
 
       return Context { cBlockState = MapF.fromList (MapF.Pair IR.BaseRepr baseState : blockStates)
                      , cFunctionState = MapF.fromList (MapF.Pair IR.BaseRepr baseFunctionState : funcStates)
+                     , cBaseFunction = fh
                      }
     _ -> do
       bs <- makeAlternativeBlockState b irrepr
       mfs <- fmap (MapF.Pair irrepr) <$> makeFunctionState tcache ares fh irrepr
       return Context { cBlockState = MapF.fromList [ MapF.Pair irrepr bs ]
                      , cFunctionState = MapF.fromList (maybeToList mfs)
+                     , cBaseFunction = fh
                      }
 
 makeFunctionState :: (CA.Architecture arch s, CA.ArchConstraints ir s)
@@ -294,6 +296,9 @@ makeBlockState tcache ares fh origBlock rep = do
                         , bsRepr = rep
                         }
     return bs
+
+baseFunctionG :: L.Getter (Context arch s) (CA.FunctionHandle arch s)
+baseFunctionG = L.to cBaseFunction
 
 blockStateL :: L.Lens' (Context arch s) (MapF.MapF (IR.IRRepr arch) (BlockState arch s))
 blockStateL = GL.field @"cBlockState"

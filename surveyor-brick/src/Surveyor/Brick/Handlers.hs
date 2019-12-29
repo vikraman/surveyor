@@ -1,5 +1,6 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -276,7 +277,8 @@ handleCustomEvent s0 evt =
           liftIO (C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogDebug) (Fmt.fmt ("Finding block at address " +| C.prettyAddress addr |+ ""))))
           case C.containingBlocks ares addr of
             [b] -> do
-              liftIO (C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr b))
+              let fh = C.blockFunction b
+              liftIO (C.sEmitEvent s0 (C.PushContext archNonce fh C.BaseRepr b))
               liftIO (C.sEmitEvent s0 (C.ViewBlock archNonce C.BaseRepr))
               B.continue (C.State s0)
             blocks -> do
@@ -286,7 +288,8 @@ handleCustomEvent s0 evt =
     C.ListBlocks archNonce blocks
       | Just Refl <- testEquality (s0 ^. C.lNonce) archNonce -> do
           let callback b = do
-                C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr b)
+                let fh = C.blockFunction b
+                C.sEmitEvent s0 (C.PushContext archNonce fh C.BaseRepr b)
                 C.logDiagnostic s0 C.LogDebug (Fmt.fmt ("Pushing a block to view: " +| C.blockAddress b ||+""))
                 C.sEmitEvent s0 (C.ViewBlock archNonce C.BaseRepr)
           let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.BlockSelector
@@ -313,17 +316,17 @@ handleCustomEvent s0 evt =
                     C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogWarning) (Fmt.fmt ("Failed to find blocks for function: " +| f ||+"")))
                   entryBlock : _ -> do
                     C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogDebug) (Fmt.fmt ("Selecting function: " +| f ||+ "")))
-                    C.sEmitEvent s0 (C.PushContext archNonce C.BaseRepr entryBlock)
+                    C.sEmitEvent s0 (C.PushContext archNonce f C.BaseRepr entryBlock)
                     C.sEmitEvent s0 (C.ViewFunction archNonce C.BaseRepr)
           let s1 = s0 & C.lUIMode .~ C.SomeUIMode C.FunctionSelector
                       & C.lArchState . _Just . functionSelectorL .~ FS.functionSelector callback focusedListAttr funcs
           B.continue (C.State s1)
       | otherwise -> B.continue (C.State s0)
 
-    C.PushContext archNonce _irrepr b
+    C.PushContext archNonce fh irrepr b
       | Just archState <- s0 ^. C.lArchState
       , Just Refl <- testEquality (s0 ^. C.lNonce) archNonce -> do
-          ctx <- liftIO $ C.makeContext (archState ^. C.irCacheL) (archState ^. C.lAnalysisResult) b
+          ctx <- liftIO $ C.makeContext (archState ^. C.irCacheL) (archState ^. C.lAnalysisResult) fh irrepr b
           let s1 = s0 & C.lArchState . _Just . C.contextL %~ C.pushContext ctx
           liftIO $ C.sEmitEvent s0 (C.LogDiagnostic (Just C.LogDebug) (Fmt.fmt ("Selecting block: " +| C.blockAddress b ||+ "")))
           liftIO $ C.logDiagnostic s0 C.LogDebug (Fmt.fmt ("from function " +| C.blockFunction b ||+ ""))
@@ -420,7 +423,7 @@ stateFromAnalysisResult s0 ares newDiags state uiMode = do
                let pushContext newVal oldState = oldState & C.lArchState . _Just . C.contextL %~ C.pushContext newVal
                C.asynchronously (C.archNonce ares) (C.sEmitEvent s0) pushContext $ do
                  case C.functionBlocks ares defFunc of
-                   b0 : _ -> C.makeContext tcache ares b0
+                   b0 : _ -> C.makeContext tcache ares defFunc C.BaseRepr b0
                    _ -> error ("No blocks in function " ++ show defFunc)
   return C.S { C.sDiagnosticLog = C.sDiagnosticLog s0 <> fmap (Nothing,) newDiags
              , C.sDiagnosticLevel = C.sDiagnosticLevel s0
@@ -445,9 +448,9 @@ stateFromAnalysisResult s0 ares newDiags state uiMode = do
                                          : [ MapF.Pair rep (BV.blockViewer InteractiveBlockViewer rep)
                                            | C.SomeIRRepr rep <- C.alternativeIRs (Proxy @(arch, s))
                                            ]
-                        let funcViewerCallback :: forall ir . C.IRRepr arch ir -> C.Block ir s -> IO ()
-                            funcViewerCallback rep b = do
-                              C.sEmitEvent s0 (C.PushContext (C.archNonce ares) rep b)
+                        let funcViewerCallback :: forall ir . (C.ArchConstraints ir s) => C.IRRepr arch ir -> C.FunctionHandle arch s -> C.Block ir s -> IO ()
+                            funcViewerCallback rep fh b = do
+                              C.sEmitEvent s0 (C.PushContext (C.archNonce ares) fh rep b)
                               C.sEmitEvent s0 (C.ViewBlock (C.archNonce ares) rep)
                         let funcViewers = (MapF.Pair C.BaseRepr (FV.functionViewer (funcViewerCallback C.BaseRepr) FunctionCFGViewer C.BaseRepr))
                                           : [ MapF.Pair rep (FV.functionViewer (funcViewerCallback rep) FunctionCFGViewer rep)

@@ -92,6 +92,7 @@ module Surveyor.Core (
   CCX.contextBack,
   CCX.contextForward,
   -- ** Lenses
+  CCX.baseFunctionG,
   CCX.currentContext,
   CCX.blockStateFor,
   CCX.blockStateList,
